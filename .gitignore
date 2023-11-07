@@ -8,3 +8,4 @@ cabal-dev
 *.swp
 /tarballs/
 stack.yaml.lock
+node_modules
