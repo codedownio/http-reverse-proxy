@@ -23,5 +23,5 @@ main = do
 
   run port $
     waiProxyTo (\_req -> pure (WPRProxyDest (ProxyDest "localhost" proxyToPort)))
-               (\e _req respond -> respond $ responseLBS N.status500 [] [i|Proxy exception: #{e}|])
+               defaultOnExc
                manager
