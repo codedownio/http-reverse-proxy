@@ -399,7 +399,7 @@ waiProxyToSettings getDest wps' manager req0 sendResponse = do
             -- But WAI requires us to provide a default response when using WAI.responseRaw
             let defaultResponse = WAI.responseLBS HT.conflict409 [] mempty
 
-            sendResponse $ flip WAI.responseRaw defaultResponse $ \_readFromClient sendToClient -> do
+            sendResponse $ WAI.responseSuperRaw $ \sendToClient -> do
               let req' =
 #if MIN_VERSION_http_client(0, 5, 0)
                     HC.defaultRequest
