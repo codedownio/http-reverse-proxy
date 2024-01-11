@@ -9,8 +9,15 @@ app.get("/simple", (req, res) => {
   res.send("Simple response!");
 });
 
-app.get("/early_hints", (req, res) => {
+app.get("/early_hints", async (req, res) => {
   res.writeEarlyHints({ link: ["</some-file.js>", "</some-other-file.js>"] })
+
+  await new Promise((resolve) => { setTimeout(resolve, 1000); });
+
+  res.writeEarlyHints({ link: ["</some-baz.js>"] })
+
+  await new Promise((resolve) => { setTimeout(resolve, 1000); });
+
   res.send("Early hints response!");
 });
 
