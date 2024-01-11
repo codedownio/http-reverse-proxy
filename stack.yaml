@@ -1,26 +1,13 @@
 resolver: lts-21.21
 
+packages:
+- .
+
 nix:
   pure: false
   packages:
   - zlib
 
 extra-deps:
-- git: https://github.com/codedownio/wai.git
-  commit: b00e177c961140b3528868d3a71967b6807eadf5
-  subdirs:
-    - wai
-    - warp
-
-- crypto-token-0.0.2
-- crypton-0.34
-- crypton-x509-1.7.6
-- crypton-x509-store-1.6.9
-- crypton-x509-system-1.6.7
-- crypton-x509-validation-1.6.12
-- http2-5.0.0
-- http3-0.0.7
-- network-control-0.0.2
-- network-udp-0.0.0
-- quic-0.1.12
-- sockaddr-0.0.1
+# >=0.7.16 is required for early hints support
+- http-client-0.7.16

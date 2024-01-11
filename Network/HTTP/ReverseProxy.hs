@@ -395,11 +395,12 @@ waiProxyToSettings getDest wps' manager req0 sendResponse = do
                       WAI.KnownLength i -> HC.RequestBodyStream (fromIntegral i) scb
                       WAI.ChunkedBody -> HC.RequestBodyStreamChunked scb
 
-            -- We don't want this to be used, especially the status...
-            -- But WAI requires us to provide a default response when using WAI.responseRaw
+            -- We don't want this to be used, but WAI requires us to provide a default response
+            -- when using WAI.responseRaw. This should be fine because none of the functions like
+            -- 'responseStatus' or 'responseHeaders' should be called on this.
             let defaultResponse = WAI.responseLBS HT.conflict409 [] mempty
 
-            sendResponse $ WAI.responseSuperRaw $ \sendToClient -> do
+            sendResponse $ flip WAI.responseRaw defaultResponse $ \_ sendToClient -> do
               let req' =
 #if MIN_VERSION_http_client(0, 5, 0)
                     HC.defaultRequest
@@ -420,12 +421,11 @@ waiProxyToSettings getDest wps' manager req0 sendResponse = do
                       , HC.requestBody = body
                       , HC.redirectCount = 0
 #if MIN_VERSION_http_client(0, 7, 16)
-                      , HC.earlyHintHeadersReceived = \headers -> do
-                          sendToClient "HTTP/1.1 103 Early Hints\r\n"
-                          forM_ headers $ \(name, value) -> do
-                            let line :: Builder = fromByteString (CI.original name) <> ": " <> fromByteString value <> "\r\n"
-                            sendToClient (L.toStrict $ toLazyByteString line)
-                          sendToClient "\r\n"
+                      , HC.earlyHintHeadersReceived = \headers ->
+                            sendToClient $ L.toStrict $ toLazyByteString $
+                                fromByteString "HTTP/1.1 103 Early Hints\r\n"
+                                <> mconcat [renderHeader h | h <- headers]
+                                <> "\r\n"
 #endif
                       }
               bracket
@@ -444,22 +444,27 @@ waiProxyToSettings getDest wps' manager req0 sendResponse = do
                               noChunked = HT.httpMajor (WAI.httpVersion req) >= 2 || WAI.requestMethod req == HT.methodHead
 
                           let (HT.Status code message) = HC.responseStatus res
-                          let line :: Builder = fromByteString (S8.pack $ show (HC.responseVersion res)) <> " " <> fromByteString (S8.pack $ show code) <> " " <> fromByteString message <> "\r\n"
-                          sendToClient (L.toStrict $ toLazyByteString line)
+                          sendToClient $ L.toStrict $ toLazyByteString $
+                            fromByteString (S8.pack $ show (HC.responseVersion res)) <> " " <> fromByteString (S8.pack $ show code) <> " " <> fromByteString message <> "\r\n"
 
                           let headers = (filter (\(key, v) -> not (key `Set.member` strippedHeaders) ||
                                                                    key == "content-length" && (noChunked || v == "0"))
                                         (HC.responseHeaders res))
-                          forM_ headers $ \(name, value) -> do
-                            let line :: Builder = fromByteString (CI.original name) <> ": " <> fromByteString value <> "\r\n"
-                            sendToClient (L.toStrict $ toLazyByteString line)
-                          sendToClient "\r\n"
+                          sendToClient $ L.toStrict $ toLazyByteString $
+                              mconcat [renderHeader h | h <- headers]
+                              <> "\r\n"
 
+                          -- It may look strange that we don't handle 'Flush' here, but 'Flush' is not actually used anywhere
+                          -- except at the end of the stream in the conduit above.
                           runConduit $ src .| conduit .| CL.mapM_ (\mb ->
                               case mb of
                                   Flush -> return ()
                                   Chunk b -> sendToClient (toByteString b)
                               )
+
+  where
+    renderHeader :: HT.Header -> Builder
+    renderHeader (name, value) = fromByteString (CI.original name) <> ": " <> fromByteString value <> "\r\n"
 
 -- | Introduce a minor level of caching to handle some basic
 -- retry cases inside http-client. But to avoid a DoS attack,
