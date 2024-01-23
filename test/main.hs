@@ -2,7 +2,6 @@
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 import           Blaze.ByteString.Builder     (fromByteString)
-import           Control.Applicative          ((<$>))
 import           Control.Concurrent           (forkIO, killThread, newEmptyMVar,
                                                putMVar, takeMVar, threadDelay)
 import           Control.Exception            (IOException, bracket,
