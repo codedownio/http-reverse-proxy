@@ -280,15 +280,16 @@ main = hspec $ do
     describe "http-reverse-proxy (Unix)" $ do
         it "works" $
             let content = "mainApp"
-             in withMan $ \manager ->
-                withWAppUnix (\_ f -> f $ responseLBS status200 [] content) $ \socketPath1 ->
-                withWAppUnix (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestUnix socketPath1) defaultOnExc manager) $ \socketPath2 ->
-                withCAppUnix (rawProxyTo (const $ return $ Right $ proxyDestUnix socketPath2)) $ \socketPath3 ->
-                withCAppUnix (rawTcpProxyTo (proxyDestUnix socketPath3)) $ \socketPath4 -> do
-                    mgr <- HC.newManager defaultManagerSettings { managerRawConnection = createUnixConnection socketPath4 }
-                    req <- HC.parseUrl "http://127.0.0.1/"
-                    res <- HC.httpLbs req mgr
-                    putStrLn ("res: " <> show res)
+             in withWAppUnix (\_ f -> f $ responseLBS status200 [] content) $ \socketPath1 -> do
+                  -- Make a special manager to pass to waiProxyTo so we can reach the Unix socket
+                  mgr1 <- HC.newManager defaultManagerSettings { managerRawConnection = createUnixConnection socketPath1 }
+                  withWAppUnix (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestUnix socketPath1) defaultOnExc mgr1) $ \socketPath2 ->
+                    withCAppUnix (rawProxyTo (const $ return $ Right $ proxyDestUnix socketPath2)) $ \socketPath3 ->
+                    withCAppUnix (rawTcpProxyTo (proxyDestUnix socketPath3)) $ \socketPath4 -> do
+                      mgr <- HC.newManager defaultManagerSettings { managerRawConnection = createUnixConnection socketPath4 }
+                      req <- HC.parseUrlThrow "http://127.0.0.1/"
+                      res <- HC.httpLbs req mgr
+                      HC.responseBody res `shouldBe` content
 
     {- FIXME
     describe "waiToRaw" $ do
