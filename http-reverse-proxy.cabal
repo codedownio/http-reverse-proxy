@@ -56,6 +56,7 @@ test-suite test
                        , crypton-connection
                        , filepath
                        , hspec                      >= 1.3
+                       , http-client
                        , http-conduit               >= 2.3
                        , http-types
                        , network

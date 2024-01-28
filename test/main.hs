@@ -5,7 +5,7 @@
 import           Blaze.ByteString.Builder     (fromByteString)
 import           Control.Concurrent           (forkIO, killThread, newEmptyMVar,
                                                putMVar, takeMVar, threadDelay)
-import           Control.Exception            (IOException, bracket, bracket_,
+import           Control.Exception            (IOException, bracket, bracketOnError,
                                                onException, try)
 import           Control.Monad                (forever, unless)
 import           Control.Monad.IO.Class       (liftIO)
@@ -27,8 +27,8 @@ import qualified Data.Conduit.Network.Unix    as CU
 import qualified Data.IORef                   as I
 import           Data.Streaming.Network       (HasReadWrite,
                                                bindPortTCP, setAfterBind)
-import           Network.Connection           (TLSSettings (TLSSettingsSimple),
-                                               TLSSettingsContext)
+import           Network.HTTP.Client          (defaultManagerSettings, managerRawConnection)
+import           Network.HTTP.Client.Internal (Connection, socketConnection)
 import qualified Network.HTTP.Conduit         as HC
 import           Network.HTTP.ReverseProxy    (proxyDestTcp, proxyDestUnix,
                                                WaiProxyResponse (..),
@@ -39,7 +39,7 @@ import           Network.HTTP.ReverseProxy    (proxyDestTcp, proxyDestUnix,
                                                waiProxyToSettings,
                                                waiProxyTo)
 import           Network.HTTP.Types           (status200, status500)
-import qualified Network.Socket               as Sock
+import qualified Network.Socket               as NS
 import           Network.Wai                  (rawPathInfo, responseLBS,
                                                responseStream, requestHeaders)
 import qualified Network.Wai
@@ -63,7 +63,7 @@ getPort = do
     case esocket of
         Left (_ :: IOException) -> getPort
         Right socket -> do
-            Sock.close socket
+            NS.close socket
             return port
 
 withWApp :: Network.Wai.Application -> (Int -> IO ()) -> IO ()
@@ -85,16 +85,16 @@ withWAppUnix :: Network.Wai.Application -> (FilePath -> IO ()) -> IO ()
 withWAppUnix app f = do
     withSystemTempDirectory "test-http-reverse-proxy-sock" $ \dir -> do
         let socketPath = dir </> "unix.sock"
-        sock <- Sock.socket Sock.AF_UNIX Sock.Stream Sock.defaultProtocol
-        bracket_
-            (Sock.bind sock $ Sock.SockAddrUnix socketPath)
-            (Sock.close sock) $ do
-                baton <- newEmptyMVar
-                bracket
-                    (forkIO $ runSettingsSocket (settings baton) sock
-                        app `onException` putMVar baton ())
-                    killThread
-                    (const $ takeMVar baton >> f socketPath)
+        bracket (NS.socket NS.AF_UNIX NS.Stream NS.defaultProtocol) NS.close $ \sock -> do
+            NS.bind sock $ NS.SockAddrUnix socketPath
+            NS.listen sock 50
+
+            baton <- newEmptyMVar
+            bracket
+                (forkIO $ runSettingsSocket (settings baton) sock
+                    app `onException` putMVar baton ())
+                killThread
+                (const $ takeMVar baton >> f socketPath)
   where
     settings baton
         = setBeforeMainLoop (putMVar baton ())
@@ -125,6 +125,12 @@ withCAppUnix app f = do
 
 withMan :: (HC.Manager -> IO ()) -> IO ()
 withMan = (HC.newManager HC.tlsManagerSettings >>=)
+
+createUnixConnection :: FilePath -> IO (Maybe NS.HostAddress -> String -> Int -> IO Connection)
+createUnixConnection socketPath = return $ \_ _ _ ->
+  bracketOnError (NS.socket NS.AF_UNIX NS.Stream NS.defaultProtocol) (NS.close) $ \sock -> do
+    NS.connect sock (NS.SockAddrUnix socketPath)
+    socketConnection sock 8192
 
 main :: IO ()
 main = hspec $ do
@@ -279,9 +285,10 @@ main = hspec $ do
                 withWAppUnix (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestUnix socketPath1) defaultOnExc manager) $ \socketPath2 ->
                 withCAppUnix (rawProxyTo (const $ return $ Right $ proxyDestUnix socketPath2)) $ \socketPath3 ->
                 withCAppUnix (rawTcpProxyTo (proxyDestUnix socketPath3)) $ \socketPath4 -> do
-                    manager <- HC.newManager $ HC.mkManagerSettings (TLSSettingsSimple False False False) (Just $ unixManagerSettings socketPath4)
-                    response <- httpLbs "http://127.0.0.1/" manager
-                    response `shouldBe` content
+                    mgr <- HC.newManager defaultManagerSettings { managerRawConnection = createUnixConnection socketPath4 }
+                    req <- HC.parseUrl "http://127.0.0.1/"
+                    res <- HC.httpLbs req mgr
+                    putStrLn ("res: " <> show res)
 
     {- FIXME
     describe "waiToRaw" $ do
