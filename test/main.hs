@@ -128,7 +128,7 @@ withMan = (HC.newManager HC.tlsManagerSettings >>=)
 
 createUnixConnection :: FilePath -> IO (Maybe NS.HostAddress -> String -> Int -> IO Connection)
 createUnixConnection socketPath = return $ \_ _ _ ->
-  bracketOnError (NS.socket NS.AF_UNIX NS.Stream NS.defaultProtocol) (NS.close) $ \sock -> do
+  bracketOnError (NS.socket NS.AF_UNIX NS.Stream NS.defaultProtocol) NS.close $ \sock -> do
     NS.connect sock (NS.SockAddrUnix socketPath)
     socketConnection sock 8192
 
