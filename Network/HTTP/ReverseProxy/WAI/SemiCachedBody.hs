@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase            #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Network.HTTP.ReverseProxy.WAI.SemiCachedBody (
   semiCachedBody
