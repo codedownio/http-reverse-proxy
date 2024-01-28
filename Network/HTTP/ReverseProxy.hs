@@ -1,11 +1,4 @@
-{-# LANGUAGE DeriveGeneric         #-}
-{-# LANGUAGE FlexibleContexts      #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE OverloadedStrings     #-}
-{-# LANGUAGE ScopedTypeVariables   #-}
-{-# LANGUAGE LambdaCase            #-}
-{-# LANGUAGE TupleSections         #-}
-{-# LANGUAGE CPP                   #-}
+
 module Network.HTTP.ReverseProxy (
   -- * Types
   proxyDestTcp
