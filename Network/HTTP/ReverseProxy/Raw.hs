@@ -2,20 +2,21 @@
 
 module Network.HTTP.ReverseProxy.Raw where
 
-import           Data.ByteString                      (ByteString)
-import qualified Data.ByteString                      as S
-import qualified Data.ByteString.Char8                as S8
-import qualified Data.CaseInsensitive                 as CI
+import           Data.ByteString                 (ByteString)
+import qualified Data.ByteString                 as S
+import qualified Data.ByteString.Char8           as S8
+import qualified Data.CaseInsensitive            as CI
 import           Data.Conduit
-import qualified Data.Conduit.Network                 as DCN
-import           Data.Functor.Identity                (Identity (..))
+import qualified Data.Conduit.Network            as DCN
+import qualified Data.Conduit.Network.Unix       as DCNU
+import           Data.Functor.Identity           (Identity (..))
 import           Data.IORef
-import           Data.Maybe                           (fromMaybe)
-import           Data.Streaming.Network               (AppData, readLens)
-import           Data.Word8                           (isSpace, _colon, _cr)
+import           Data.Maybe                      (fromMaybe)
+import           Data.Streaming.Network          (AppData, readLens)
+import           Data.Word8                      (isSpace, _colon, _cr)
 import           Network.HTTP.ReverseProxy.Types
-import qualified Network.HTTP.Types                   as HT
-import           UnliftIO                             (MonadIO, liftIO, MonadUnliftIO, concurrently_)
+import qualified Network.HTTP.Types              as HT
+import           UnliftIO                        (MonadIO, liftIO, MonadUnliftIO, concurrently_)
 
 
 -- | Set up a reverse proxy server, which will have a minimal overhead.
@@ -32,12 +33,14 @@ import           UnliftIO                             (MonadIO, liftIO, MonadUnl
 -- 4. Pass all bytes across the wire unchanged.
 --
 -- If you need more control, such as modifying the request or response, use 'waiProxyTo'.
-rawProxyTo :: MonadUnliftIO m
-           => (HT.RequestHeaders -> m (Either (DCN.AppData -> m ()) ProxyDest))
-           -- ^ How to reverse proxy. A @Left@ result will run the given
-           -- 'DCN.Application', whereas a @Right@ will reverse proxy to the
-           -- given host\/port.
-           -> AppData -> m ()
+rawProxyTo :: (
+  MonadUnliftIO m
+  ) => (HT.RequestHeaders -> m (Either (DCN.AppData -> m ()) ProxyDest))
+    -- ^ How to reverse proxy. A @Left@ result will run the given
+    -- 'DCN.Application', whereas a @Right@ will reverse proxy to the
+    -- given host\/port.
+    -> AppData
+    -> m ()
 rawProxyTo getDest appdata = do
     (rsrc, headers) <- liftIO $ fromClient $$+ getHeaders
     edest <- getDest headers
@@ -54,7 +57,9 @@ rawProxyTo getDest appdata = do
             app $ runIdentity (readLens (const (Identity readData)) appdata)
 
 
-        Right (ProxyDest host port) -> liftIO $ DCN.runTCPClient (DCN.clientSettings port host) (withServer rsrc)
+        Right (ProxyDestTcp host port) -> liftIO $ DCN.runTCPClient (DCN.clientSettings port host) (withServer rsrc)
+        Right (ProxyDestUnix socketPath) -> liftIO $ DCNU.runUnixClient (DCNU.clientSettings socketPath) (withServer rsrc)
+
   where
     fromClient = DCN.appSource appdata
     toClient = DCN.appSink appdata
@@ -77,12 +82,10 @@ rawProxyTo getDest appdata = do
 -- If you need more control, such as modifying the request or response, use 'waiProxyTo'.
 --
 -- @since 0.4.4
-rawTcpProxyTo :: MonadIO m
-           => ProxyDest
-           -> AppData
-           -> m ()
-rawTcpProxyTo (ProxyDest host port) appdata = liftIO $
-    DCN.runTCPClient (DCN.clientSettings port host) withServer
+rawTcpProxyTo :: MonadIO m => ProxyDest -> AppData -> m ()
+rawTcpProxyTo proxyDest appdata = liftIO $ case proxyDest of
+  (ProxyDestTcp host port) -> DCN.runTCPClient (DCN.clientSettings port host) withServer
+  (ProxyDestUnix socketPath) -> DCNU.runUnixClient (DCNU.clientSettings socketPath) withServer
   where
     withServer appdataServer = concurrently_
       (runConduit $ DCN.appSource appdata       .| DCN.appSink appdataServer)

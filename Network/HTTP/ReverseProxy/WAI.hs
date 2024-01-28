@@ -1,38 +1,41 @@
 {-# LANGUAGE CPP                   #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE RankNTypes            #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TupleSections         #-}
 
 module Network.HTTP.ReverseProxy.WAI where
 
-import           Blaze.ByteString.Builder             (Builder, fromByteString, toByteString, toLazyByteString)
-import           Control.Applicative                  ((<|>))
-import           Control.Monad                        (unless, when)
-import           Data.ByteString                      (ByteString)
-import qualified Data.ByteString                      as S
-import           Data.ByteString.Builder.HTTP.Chunked (chunkedTransferEncoding, chunkedTransferTerminator)
-import qualified Data.ByteString.Char8                as S8
-import qualified Data.ByteString.Lazy                 as L
-import qualified Data.CaseInsensitive                 as CI
+import           Blaze.ByteString.Builder                     (Builder, fromByteString, toByteString, toLazyByteString)
+import           Control.Applicative                          ((<|>))
+import           Control.Monad                                (unless, when)
+import           Data.ByteString                              (ByteString)
+import qualified Data.ByteString                              as S
+import           Data.ByteString.Builder.HTTP.Chunked         (chunkedTransferEncoding, chunkedTransferTerminator)
+import qualified Data.ByteString.Char8                        as S8
+import qualified Data.ByteString.Lazy                         as L
+import qualified Data.CaseInsensitive                         as CI
 import           Data.Conduit
-import qualified Data.Conduit.List                    as CL
-import qualified Data.Conduit.Network                 as DCN
-import           Data.Maybe                           (fromMaybe, isJust, listToMaybe)
-import           Data.Set                             (Set)
-import qualified Data.Set                             as Set
-import qualified Data.Text                            as T
-import qualified Data.Text.Encoding                   as TE
-import           Network.HTTP.Client                  (BodyReader, brRead)
-import qualified Network.HTTP.Client                  as HC
+import qualified Data.Conduit.List                            as CL
+import qualified Data.Conduit.Network                         as DCN
+import qualified Data.Conduit.Network.Unix                    as DCNU
+import           Data.Maybe                                   (fromMaybe, isJust, listToMaybe)
+import           Data.Set                                     (Set)
+import qualified Data.Set                                     as Set
+import           Data.Streaming.Network                       (HasReadWrite)
+import qualified Data.Text                                    as T
+import qualified Data.Text.Encoding                           as TE
+import           Network.HTTP.Client                          (BodyReader, brRead)
+import qualified Network.HTTP.Client                          as HC
 import           Network.HTTP.ReverseProxy.Types
 import           Network.HTTP.ReverseProxy.WAI.SemiCachedBody
 import           Network.HTTP.ReverseProxy.WAI.Types
-import qualified Network.HTTP.Types                   as HT
-import qualified Network.HTTP.Types.Header            as H
-import qualified Network.Wai                          as WAI
-import           Network.Wai.Logger                   (showSockAddr)
-import           UnliftIO                             (MonadIO, liftIO, timeout, SomeException, try, bracket, concurrently_)
+import qualified Network.HTTP.Types                           as HT
+import qualified Network.HTTP.Types.Header                    as H
+import qualified Network.Wai                                  as WAI
+import           Network.Wai.Logger                           (showSockAddr)
+import           UnliftIO                                     (MonadIO, liftIO, timeout, SomeException, try, bracket, concurrently_)
 
 
 -- | Creates a WAI 'WAI.Application' which will handle reverse proxies.
@@ -49,13 +52,15 @@ import           UnliftIO                             (MonadIO, liftIO, timeout,
 -- Note: This function will use chunked request bodies for communicating with
 -- the proxied server. Not all servers necessarily support chunked request
 -- bodies, so please confirm that yours does (Warp, Snap, and Happstack, for example, do).
-waiProxyTo :: (WAI.Request -> IO WaiProxyResponse)
-           -- ^ How to reverse proxy.
-           -> (SomeException -> WAI.Request -> (ByteString -> IO ()) -> IO ())
-           -- ^ How to handle exceptions when calling remote server. For a
-           -- simple 502 error page, use 'defaultOnExc'.
-           -> HC.Manager -- ^ connection manager to utilize
-           -> WAI.Application
+waiProxyTo ::
+  (WAI.Request -> IO WaiProxyResponse)
+  -- ^ How to reverse proxy.
+  -> (SomeException -> WAI.Request -> (ByteString -> IO ()) -> IO ())
+  -- ^ How to handle exceptions when calling remote server. For a
+  -- simple 502 error page, use 'defaultOnExc'.
+  -> HC.Manager
+  -- ^ connection manager to utilize
+  -> WAI.Application
 waiProxyTo getDest onError = waiProxyToSettings getDest defaultWaiProxySettings { wpsOnExc = onError }
 
 
@@ -83,94 +88,107 @@ waiProxyToSettings getDest wps' manager req0 sendResponse = do
                 Nothing -> sendResponse $ WAI.responseLBS HT.status500 [] "timeBound"
     case edest of
         Left app -> maybe id timeBound (lpsTimeBound lps) $ app req0 sendResponse
-        Right (ProxyDest host port, req, secure) -> tryWebSockets wps host port req sendResponse $ do
-            scb <- semiCachedBody (WAI.requestBody req)
-            let body =
-                  case WAI.requestBodyLength req of
-                      WAI.KnownLength i -> HC.RequestBodyStream (fromIntegral i) scb
-                      WAI.ChunkedBody -> HC.RequestBodyStreamChunked scb
+        Right (ProxyDestTcp host port, req, secure) -> tryWebSockets wps (DCN.runTCPClient (DCN.clientSettings port host)) req sendResponse $
+            proxyNormally manager wps lps (Just (host, port)) req secure sendResponse
+        Right (ProxyDestUnix socketPath, req, secure) -> tryWebSockets wps (DCNU.runUnixClient (DCNU.clientSettings socketPath)) req sendResponse $
+            proxyNormally manager wps lps Nothing req secure sendResponse
 
-            -- We don't want this to be used, but WAI requires us to provide a default response
-            -- when using WAI.responseRaw. This should be fine because none of the functions like
-            -- 'responseStatus' or 'responseHeaders' should be called on this.
-            let defaultResponse = WAI.responseLBS HT.conflict409 [] mempty
+proxyNormally :: HC.Manager
+              -> WaiProxySettings
+              -> LocalWaiProxySettings
+              -> Maybe (ByteString, Int)
+              -> WAI.Request
+              -> Bool
+              -> (WAI.Response -> IO b)
+              -> IO b
+proxyNormally manager wps lps maybeHostPort req secure sendResponse = do
+  scb <- semiCachedBody (WAI.requestBody req)
+  let body =
+        case WAI.requestBodyLength req of
+            WAI.KnownLength i -> HC.RequestBodyStream (fromIntegral i) scb
+            WAI.ChunkedBody -> HC.RequestBodyStreamChunked scb
 
-            sendResponse $ flip WAI.responseRaw defaultResponse $ \_ sendToClient -> do
-              let req' =
-                    HC.defaultRequest
-                      { HC.checkResponse = \_ _ -> return ()
-                      , HC.responseTimeout = maybe HC.responseTimeoutNone HC.responseTimeoutMicro $ lpsTimeBound lps
-                      , HC.method = WAI.requestMethod req
-                      , HC.secure = secure
-                      , HC.host = host
-                      , HC.port = port
-                      , HC.path = WAI.rawPathInfo req
-                      , HC.queryString = WAI.rawQueryString req
-                      , HC.requestHeaders = fixReqHeaders wps req
-                      , HC.requestBody = body
-                      , HC.redirectCount = 0
-                      , HC.earlyHintHeadersReceived = \headers ->
-                            sendToClient $ L.toStrict $ toLazyByteString $
-                                fromByteString "HTTP/1.1 103 Early Hints\r\n"
-                                <> mconcat [renderHeader h | h <- headers]
-                                <> "\r\n"
-                      }
-              bracket
-                  (try $ do
-                     liftIO $ wpsLogRequest wps' req'
-                     HC.responseOpen req' manager
-                  )
-                  (either (const $ return ()) HC.responseClose)
-                  $ \case
-                      Left (e :: SomeException) -> wpsOnExc wps e req sendToClient
-                      Right res -> do
-                          let conduit = fromMaybe
-                                          (awaitForever (\bs -> yield (Chunk $ fromByteString bs) >> yield Flush))
-                                          (wpsProcessBody wps req $ const () <$> res)
-                              src = bodyReaderSource $ HC.responseBody res
-                              noChunked = HT.httpMajor (WAI.httpVersion req) >= 2 || WAI.requestMethod req == HT.methodHead
+  -- We don't want this to be used, but WAI requires us to provide a default response
+  -- when using WAI.responseRaw. This should be fine because none of the functions like
+  -- 'responseStatus' or 'responseHeaders' should be called on this.
+  let defaultResponse = WAI.responseLBS HT.conflict409 [] mempty
 
-                          let (HT.Status code message) = HC.responseStatus res
-                          sendToClient $ L.toStrict $ toLazyByteString $
-                            fromByteString (S8.pack $ show (HC.responseVersion res)) <> " " <> fromByteString (S8.pack $ show code) <> " " <> fromByteString message <> "\r\n"
+  sendResponse $ flip WAI.responseRaw defaultResponse $ \_ sendToClient -> do
+    let req' =
+          HC.defaultRequest
+            { HC.checkResponse = \_ _ -> return ()
+            , HC.responseTimeout = maybe HC.responseTimeoutNone HC.responseTimeoutMicro $ lpsTimeBound lps
+            , HC.method = WAI.requestMethod req
+            , HC.secure = secure
+            , HC.host = maybe (HC.host HC.defaultRequest) fst maybeHostPort
+            , HC.port = maybe (HC.port HC.defaultRequest) snd maybeHostPort
+            , HC.path = WAI.rawPathInfo req
+            , HC.queryString = WAI.rawQueryString req
+            , HC.requestHeaders = fixReqHeaders wps req
+            , HC.requestBody = body
+            , HC.redirectCount = 0
+            , HC.earlyHintHeadersReceived = \headers ->
+                  sendToClient $ L.toStrict $ toLazyByteString $
+                      fromByteString "HTTP/1.1 103 Early Hints\r\n"
+                      <> mconcat [renderHeader h | h <- headers]
+                      <> "\r\n"
+            }
+    bracket
+        (try $ do
+           liftIO $ wpsLogRequest wps req'
+           HC.responseOpen req' manager
+        )
+        (either (const $ return ()) HC.responseClose)
+        $ \case
+            Left (e :: SomeException) -> wpsOnExc wps e req sendToClient
+            Right res -> do
+                let conduit = fromMaybe
+                                (awaitForever (\bs -> yield (Chunk $ fromByteString bs) >> yield Flush))
+                                (wpsProcessBody wps req $ const () <$> res)
+                    src = bodyReaderSource $ HC.responseBody res
+                    noChunked = HT.httpMajor (WAI.httpVersion req) >= 2 || WAI.requestMethod req == HT.methodHead
 
-                          -- Handle HTTP chunking, just as Warp does for WAI.responseStream
-                          let requestIsChunked = not noChunked
-                          let responseHasLength = isJust (lookup "content-length" (HC.responseHeaders res))
-                          let needsChunked = requestIsChunked && not responseHasLength
+                let (HT.Status code message) = HC.responseStatus res
+                sendToClient $ L.toStrict $ toLazyByteString $
+                  fromByteString (S8.pack $ show (HC.responseVersion res)) <> " " <> fromByteString (S8.pack $ show code) <> " " <> fromByteString message <> "\r\n"
 
-                          let headers' = (filter (\(key, v) -> not (key `Set.member` strippedHeaders) ||
-                                                                    key == "content-length" && (noChunked || v == "0"))
-                                         (HC.responseHeaders res))
-                          let headers
-                                | needsChunked = (H.hTransferEncoding, "chunked") : headers'
-                                | otherwise = headers
-                          sendToClient $ L.toStrict $ toLazyByteString $
-                              mconcat [renderHeader h | h <- headers]
-                              <> "\r\n"
+                -- Handle HTTP chunking, just as Warp does for WAI.responseStream
+                let requestIsChunked = not noChunked
+                let responseHasLength = isJust (lookup "content-length" (HC.responseHeaders res))
+                let needsChunked = requestIsChunked && not responseHasLength
 
-                          -- It may look strange that we don't handle 'Flush' here, but 'Flush' is not actually used anywhere
-                          -- except at the end of the stream in the conduit above.
-                          let sendChunk
-                                | needsChunked = sendToClient . toByteString . chunkedTransferEncoding
-                                | otherwise = sendToClient . toByteString
-                          runConduit $ src .| conduit .| CL.mapM_ (\mb ->
-                              case mb of
-                                  Flush -> return ()
-                                  Chunk b -> sendChunk b
-                              )
-                          when needsChunked $ sendToClient (toByteString chunkedTransferTerminator)
+                let headers' = (filter (\(key, v) -> not (key `Set.member` strippedHeaders) ||
+                                                          key == "content-length" && (noChunked || v == "0"))
+                               (HC.responseHeaders res))
+                let headers
+                      | needsChunked = (H.hTransferEncoding, "chunked") : headers'
+                      | otherwise = headers
+                sendToClient $ L.toStrict $ toLazyByteString $
+                    mconcat [renderHeader h | h <- headers]
+                    <> "\r\n"
+
+                -- It may look strange that we don't handle 'Flush' here, but 'Flush' is not actually used anywhere
+                -- except at the end of the stream in the conduit above.
+                let sendChunk
+                      | needsChunked = sendToClient . toByteString . chunkedTransferEncoding
+                      | otherwise = sendToClient . toByteString
+                runConduit $ src .| conduit .| CL.mapM_ (\mb ->
+                    case mb of
+                        Flush -> return ()
+                        Chunk b -> sendChunk b
+                    )
+                when needsChunked $ sendToClient (toByteString chunkedTransferTerminator)
 
   where
     renderHeader :: HT.Header -> Builder
     renderHeader (name, value) = fromByteString (CI.original name) <> ": " <> fromByteString value <> "\r\n"
 
 
-tryWebSockets :: WaiProxySettings -> ByteString -> Int -> WAI.Request -> (WAI.Response -> IO b) -> IO b -> IO b
-tryWebSockets wps host port req sendResponse fallback
+tryWebSockets :: (HasReadWrite ad) => WaiProxySettings -> (forall a. (ad -> IO a) -> IO a) -> WAI.Request -> (WAI.Response -> IO b) -> IO b -> IO b
+tryWebSockets wps runConduitClient req sendResponse fallback
     | wpsUpgradeToRaw wps req =
         sendResponse $ flip WAI.responseRaw backup $ \fromClientBody toClient ->
-            DCN.runTCPClient settings $ \server ->
+            runConduitClient $ \server ->
                 let toServer = DCN.appSink server
                     fromServer = DCN.appSource server
                     fromClient = do
@@ -190,7 +208,6 @@ tryWebSockets wps host port req sendResponse fallback
   where
     backup = WAI.responseLBS HT.status500 [("Content-Type", "text/plain")]
         "http-reverse-proxy detected WebSockets request, but server does not support responseRaw"
-    settings = DCN.clientSettings port host
 
     renderHeaders :: HT.RequestHeaders -> Builder
     renderHeaders headers

@@ -8,7 +8,8 @@
 {-# LANGUAGE CPP                   #-}
 module Network.HTTP.ReverseProxy (
   -- * Types
-  ProxyDest (..)
+  proxyDestTcp
+  , proxyDestUnix
 
   -- * Raw
   , rawProxyTo
@@ -42,7 +43,17 @@ module Network.HTTP.ReverseProxy (
   -}
   ) where
 
+import Data.ByteString (ByteString)
+
 import Network.HTTP.ReverseProxy.Raw
 import Network.HTTP.ReverseProxy.Types
 import Network.HTTP.ReverseProxy.WAI
 import Network.HTTP.ReverseProxy.WAI.Types
+
+-- | TCP proxy destination (host/port)
+proxyDestTcp :: ByteString -> Int -> ProxyDest
+proxyDestTcp = ProxyDestTcp
+
+-- | Unix socket proxy destination (socket file path)
+proxyDestUnix :: FilePath -> ProxyDest
+proxyDestUnix = ProxyDestUnix
