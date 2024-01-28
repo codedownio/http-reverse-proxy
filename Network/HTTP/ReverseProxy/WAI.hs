@@ -20,7 +20,7 @@ import           Data.Conduit
 import qualified Data.Conduit.List                            as CL
 import qualified Data.Conduit.Network                         as DCN
 import qualified Data.Conduit.Network.Unix                    as DCNU
-import           Data.Maybe                                   (fromMaybe, isJust, listToMaybe)
+import           Data.Maybe                                   (fromMaybe, isNothing, listToMaybe)
 import           Data.Set                                     (Set)
 import qualified Data.Set                                     as Set
 import           Data.Streaming.Network                       (HasReadWrite)
@@ -147,22 +147,18 @@ proxyNormally manager wps lps maybeHostPort req secure sendResponse = do
                                 (wpsProcessBody wps req $ const () <$> res)
                     src = bodyReaderSource $ HC.responseBody res
                     noChunked = HT.httpMajor (WAI.httpVersion req) >= 2 || WAI.requestMethod req == HT.methodHead
+                    needsChunked = not noChunked && isNothing (lookup "content-length" (HC.responseHeaders res))
 
                 let (HT.Status code message) = HC.responseStatus res
                 sendToClient $ L.toStrict $ toLazyByteString $
                   fromByteString (S8.pack $ show (HC.responseVersion res)) <> " " <> fromByteString (S8.pack $ show code) <> " " <> fromByteString message <> "\r\n"
-
-                -- Handle HTTP chunking, just as Warp does for WAI.responseStream
-                let requestIsChunked = not noChunked
-                let responseHasLength = isJust (lookup "content-length" (HC.responseHeaders res))
-                let needsChunked = requestIsChunked && not responseHasLength
 
                 let headers' = (filter (\(key, v) -> not (key `Set.member` strippedHeaders) ||
                                                           key == "content-length" && (noChunked || v == "0"))
                                (HC.responseHeaders res))
                 let headers
                       | needsChunked = (H.hTransferEncoding, "chunked") : headers'
-                      | otherwise = headers
+                      | otherwise = headers'
                 sendToClient $ L.toStrict $ toLazyByteString $
                     mconcat [renderHeader h | h <- headers]
                     <> "\r\n"
