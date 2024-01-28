@@ -1,10 +1,11 @@
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 import           Blaze.ByteString.Builder     (fromByteString)
 import           Control.Concurrent           (forkIO, killThread, newEmptyMVar,
                                                putMVar, takeMVar, threadDelay)
-import           Control.Exception            (IOException, bracket,
+import           Control.Exception            (IOException, bracket, bracket_,
                                                onException, try)
 import           Control.Monad                (forever, unless)
 import           Control.Monad.IO.Class       (liftIO)
@@ -22,9 +23,12 @@ import           Data.Conduit.Network         (ServerSettings,
                                                appSink, appSource,
                                                clientSettings, runTCPClient,
                                                runTCPServer, serverSettings)
+import qualified Data.Conduit.Network.Unix    as CU
 import qualified Data.IORef                   as I
-import           Data.Streaming.Network       (AppData,
+import           Data.Streaming.Network       (HasReadWrite,
                                                bindPortTCP, setAfterBind)
+import           Network.Connection           (TLSSettings (TLSSettingsSimple),
+                                               TLSSettingsContext)
 import qualified Network.HTTP.Conduit         as HC
 import           Network.HTTP.ReverseProxy    (proxyDestTcp, proxyDestUnix,
                                                WaiProxyResponse (..),
@@ -35,14 +39,16 @@ import           Network.HTTP.ReverseProxy    (proxyDestTcp, proxyDestUnix,
                                                waiProxyToSettings,
                                                waiProxyTo)
 import           Network.HTTP.Types           (status200, status500)
-import qualified Network.Socket
+import qualified Network.Socket               as Sock
 import           Network.Wai                  (rawPathInfo, responseLBS,
                                                responseStream, requestHeaders)
 import qualified Network.Wai
 import           Network.Wai.Handler.Warp     (defaultSettings, runSettings,
+                                               runSettingsSocket,
                                                setBeforeMainLoop, setPort)
+import           System.FilePath              ((</>))
 import           System.IO.Unsafe             (unsafePerformIO)
-import           UnliftIO                     (timeout)
+import           UnliftIO                     (timeout, withSystemTempDirectory)
 import           UnliftIO.IORef
 import           Test.Hspec                   (describe, hspec, it, shouldBe)
 
@@ -57,7 +63,7 @@ getPort = do
     case esocket of
         Left (_ :: IOException) -> getPort
         Right socket -> do
-            Network.Socket.close socket
+            Sock.close socket
             return port
 
 withWApp :: Network.Wai.Application -> (Int -> IO ()) -> IO ()
@@ -75,7 +81,26 @@ withWApp app f = do
         $ setBeforeMainLoop (putMVar baton ())
           defaultSettings
 
-withCApp :: (AppData -> IO ()) -> (Int -> IO ()) -> IO ()
+withWAppUnix :: Network.Wai.Application -> (FilePath -> IO ()) -> IO ()
+withWAppUnix app f = do
+    withSystemTempDirectory "test-http-reverse-proxy-sock" $ \dir -> do
+        let socketPath = dir </> "unix.sock"
+        sock <- Sock.socket Sock.AF_UNIX Sock.Stream Sock.defaultProtocol
+        bracket_
+            (Sock.bind sock $ Sock.SockAddrUnix socketPath)
+            (Sock.close sock) $ do
+                baton <- newEmptyMVar
+                bracket
+                    (forkIO $ runSettingsSocket (settings baton) sock
+                        app `onException` putMVar baton ())
+                    killThread
+                    (const $ takeMVar baton >> f socketPath)
+  where
+    settings baton
+        = setBeforeMainLoop (putMVar baton ())
+          defaultSettings
+
+withCApp :: (forall ad. HasReadWrite ad => ad -> IO ()) -> (Int -> IO ()) -> IO ()
 withCApp app f = do
     port <- getPort
     baton <- newEmptyMVar
@@ -86,12 +111,24 @@ withCApp app f = do
         killThread
         (const $ takeMVar baton >> f port)
 
+withCAppUnix :: (forall ad. HasReadWrite ad => ad -> IO ()) -> (FilePath -> IO ()) -> IO ()
+withCAppUnix app f = do
+    withSystemTempDirectory "test-http-reverse-proxy-sock" $ \dir -> do
+        let socketPath = dir </> "unix.sock"
+        baton <- newEmptyMVar
+        let start = putMVar baton ()
+            settings = setAfterBind (const start) (CU.serverSettings socketPath)
+        bracket
+            (forkIO $ CU.runUnixServer settings app `onException` start)
+            killThread
+            (const $ takeMVar baton >> f socketPath)
+
 withMan :: (HC.Manager -> IO ()) -> IO ()
 withMan = (HC.newManager HC.tlsManagerSettings >>=)
 
 main :: IO ()
-main = hspec $
-    describe "http-reverse-proxy" $ do
+main = hspec $ do
+    describe "http-reverse-proxy (TCP)" $ do
         it "works" $
             let content = "mainApp"
              in withMan $ \manager ->
@@ -233,6 +270,19 @@ main = hspec $
                         _ <- HC.simpleHttp $ "http://127.0.0.1:" ++ show port4
                         lhs <- liftIO $ readIORef ref
                         lhs `shouldBe` 2
+
+    describe "http-reverse-proxy (Unix)" $ do
+        it "works" $
+            let content = "mainApp"
+             in withMan $ \manager ->
+                withWAppUnix (\_ f -> f $ responseLBS status200 [] content) $ \socketPath1 ->
+                withWAppUnix (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestUnix socketPath1) defaultOnExc manager) $ \socketPath2 ->
+                withCAppUnix (rawProxyTo (const $ return $ Right $ proxyDestUnix socketPath2)) $ \socketPath3 ->
+                withCAppUnix (rawTcpProxyTo (proxyDestUnix socketPath3)) $ \socketPath4 -> do
+                    manager <- HC.newManager $ HC.mkManagerSettings (TLSSettingsSimple False False False) (Just $ unixManagerSettings socketPath4)
+                    response <- httpLbs "http://127.0.0.1/" manager
+                    response `shouldBe` content
+
     {- FIXME
     describe "waiToRaw" $ do
         it "works" $ do

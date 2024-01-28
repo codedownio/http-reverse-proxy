@@ -1,4 +1,5 @@
-{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes        #-}
 
 module Network.HTTP.ReverseProxy.Raw where
 
@@ -12,7 +13,7 @@ import qualified Data.Conduit.Network.Unix       as DCNU
 import           Data.Functor.Identity           (Identity (..))
 import           Data.IORef
 import           Data.Maybe                      (fromMaybe)
-import           Data.Streaming.Network          (AppData, readLens)
+import           Data.Streaming.Network          (HasReadWrite, readLens)
 import           Data.Word8                      (isSpace, _colon, _cr)
 import           Network.HTTP.ReverseProxy.Types
 import qualified Network.HTTP.Types              as HT
@@ -33,13 +34,13 @@ import           UnliftIO                        (MonadIO, liftIO, MonadUnliftIO
 -- 4. Pass all bytes across the wire unchanged.
 --
 -- If you need more control, such as modifying the request or response, use 'waiProxyTo'.
-rawProxyTo :: (
-  MonadUnliftIO m
-  ) => (HT.RequestHeaders -> m (Either (DCN.AppData -> m ()) ProxyDest))
+rawProxyTo :: forall ad m. (
+  MonadUnliftIO m, HasReadWrite ad
+  ) => (HT.RequestHeaders -> m (Either (ad -> m ()) ProxyDest))
     -- ^ How to reverse proxy. A @Left@ result will run the given
     -- 'DCN.Application', whereas a @Right@ will reverse proxy to the
     -- given host\/port.
-    -> AppData
+    -> ad
     -> m ()
 rawProxyTo getDest appdata = do
     (rsrc, headers) <- liftIO $ fromClient $$+ getHeaders
@@ -82,7 +83,7 @@ rawProxyTo getDest appdata = do
 -- If you need more control, such as modifying the request or response, use 'waiProxyTo'.
 --
 -- @since 0.4.4
-rawTcpProxyTo :: MonadIO m => ProxyDest -> AppData -> m ()
+rawTcpProxyTo :: forall ad m. (HasReadWrite ad, MonadIO m) => ProxyDest -> ad -> m ()
 rawTcpProxyTo proxyDest appdata = liftIO $ case proxyDest of
   (ProxyDestTcp host port) -> DCN.runTCPClient (DCN.clientSettings port host) withServer
   (ProxyDestUnix socketPath) -> DCNU.runUnixClient (DCNU.clientSettings socketPath) withServer
