@@ -1,11 +1,11 @@
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 import           Blaze.ByteString.Builder     (fromByteString)
-import           Control.Applicative          ((<$>))
 import           Control.Concurrent           (forkIO, killThread, newEmptyMVar,
                                                putMVar, takeMVar, threadDelay)
-import           Control.Exception            (IOException, bracket,
+import           Control.Exception            (IOException, bracket, bracketOnError,
                                                onException, try)
 import           Control.Monad                (forever, unless)
 import           Control.Monad.IO.Class       (liftIO)
@@ -23,11 +23,14 @@ import           Data.Conduit.Network         (ServerSettings,
                                                appSink, appSource,
                                                clientSettings, runTCPClient,
                                                runTCPServer, serverSettings)
+import qualified Data.Conduit.Network.Unix    as CU
 import qualified Data.IORef                   as I
-import           Data.Streaming.Network       (AppData,
+import           Data.Streaming.Network       (HasReadWrite,
                                                bindPortTCP, setAfterBind)
+import           Network.HTTP.Client          (defaultManagerSettings, managerRawConnection)
+import           Network.HTTP.Client.Internal (Connection, socketConnection)
 import qualified Network.HTTP.Conduit         as HC
-import           Network.HTTP.ReverseProxy    (ProxyDest (..),
+import           Network.HTTP.ReverseProxy    (proxyDestTcp, proxyDestUnix,
                                                WaiProxyResponse (..),
                                                defaultOnExc, rawProxyTo, rawTcpProxyTo,
                                                WaiProxySettings (..),
@@ -36,14 +39,16 @@ import           Network.HTTP.ReverseProxy    (ProxyDest (..),
                                                waiProxyToSettings,
                                                waiProxyTo)
 import           Network.HTTP.Types           (status200, status500)
-import qualified Network.Socket
+import qualified Network.Socket               as NS
 import           Network.Wai                  (rawPathInfo, responseLBS,
                                                responseStream, requestHeaders)
 import qualified Network.Wai
 import           Network.Wai.Handler.Warp     (defaultSettings, runSettings,
+                                               runSettingsSocket,
                                                setBeforeMainLoop, setPort)
+import           System.FilePath              ((</>))
 import           System.IO.Unsafe             (unsafePerformIO)
-import           UnliftIO                     (timeout)
+import           UnliftIO                     (timeout, withSystemTempDirectory)
 import           UnliftIO.IORef
 import           Test.Hspec                   (describe, hspec, it, shouldBe)
 
@@ -58,7 +63,7 @@ getPort = do
     case esocket of
         Left (_ :: IOException) -> getPort
         Right socket -> do
-            Network.Socket.close socket
+            NS.close socket
             return port
 
 withWApp :: Network.Wai.Application -> (Int -> IO ()) -> IO ()
@@ -76,7 +81,26 @@ withWApp app f = do
         $ setBeforeMainLoop (putMVar baton ())
           defaultSettings
 
-withCApp :: (AppData -> IO ()) -> (Int -> IO ()) -> IO ()
+withWAppUnix :: Network.Wai.Application -> (FilePath -> IO ()) -> IO ()
+withWAppUnix app f = do
+    withSystemTempDirectory "test-http-reverse-proxy-sock" $ \dir -> do
+        let socketPath = dir </> "unix.sock"
+        bracket (NS.socket NS.AF_UNIX NS.Stream NS.defaultProtocol) NS.close $ \sock -> do
+            NS.bind sock $ NS.SockAddrUnix socketPath
+            NS.listen sock 50
+
+            baton <- newEmptyMVar
+            bracket
+                (forkIO $ runSettingsSocket (settings baton) sock
+                    app `onException` putMVar baton ())
+                killThread
+                (const $ takeMVar baton >> f socketPath)
+  where
+    settings baton
+        = setBeforeMainLoop (putMVar baton ())
+          defaultSettings
+
+withCApp :: (forall ad. HasReadWrite ad => ad -> IO ()) -> (Int -> IO ()) -> IO ()
 withCApp app f = do
     port <- getPort
     baton <- newEmptyMVar
@@ -87,19 +111,37 @@ withCApp app f = do
         killThread
         (const $ takeMVar baton >> f port)
 
+withCAppUnix :: (forall ad. HasReadWrite ad => ad -> IO ()) -> (FilePath -> IO ()) -> IO ()
+withCAppUnix app f = do
+    withSystemTempDirectory "test-http-reverse-proxy-sock" $ \dir -> do
+        let socketPath = dir </> "unix.sock"
+        baton <- newEmptyMVar
+        let start = putMVar baton ()
+            settings = setAfterBind (const start) (CU.serverSettings socketPath)
+        bracket
+            (forkIO $ CU.runUnixServer settings app `onException` start)
+            killThread
+            (const $ takeMVar baton >> f socketPath)
+
 withMan :: (HC.Manager -> IO ()) -> IO ()
 withMan = (HC.newManager HC.tlsManagerSettings >>=)
 
+createUnixConnection :: FilePath -> IO (Maybe NS.HostAddress -> String -> Int -> IO Connection)
+createUnixConnection socketPath = return $ \_ _ _ ->
+  bracketOnError (NS.socket NS.AF_UNIX NS.Stream NS.defaultProtocol) NS.close $ \sock -> do
+    NS.connect sock (NS.SockAddrUnix socketPath)
+    socketConnection sock 8192
+
 main :: IO ()
-main = hspec $
-    describe "http-reverse-proxy" $ do
+main = hspec $ do
+    describe "http-reverse-proxy (TCP)" $ do
         it "works" $
             let content = "mainApp"
              in withMan $ \manager ->
                 withWApp (\_ f -> f $ responseLBS status200 [] content) $ \port1 ->
-                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
-                withCApp (rawProxyTo (const $ return $ Right $ ProxyDest "127.0.0.1" port2)) $ \port3 ->
-                withCApp (rawTcpProxyTo (ProxyDest "127.0.0.1" port3)) $ \port4 -> do
+                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
+                withCApp (rawProxyTo (const $ return $ Right $ proxyDestTcp "127.0.0.1" port2)) $ \port3 ->
+                withCApp (rawTcpProxyTo (proxyDestTcp "127.0.0.1" port3)) $ \port4 -> do
                     lbs <- HC.simpleHttp $ "http://127.0.0.1:" ++ show port4
                     lbs `shouldBe` content
 
@@ -111,9 +153,9 @@ main = hspec $
                     pdest
              in withMan $ \manager ->
                 withWApp app $ \port1 ->
-                withWApp (waiProxyTo (modReq $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
-                withCApp (rawProxyTo (const $ return $ Right $ ProxyDest "127.0.0.1" port2)) $ \port3 ->
-                withCApp (rawTcpProxyTo (ProxyDest "127.0.0.1" port3)) $ \port4 -> do
+                withWApp (waiProxyTo (modReq $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
+                withCApp (rawProxyTo (const $ return $ Right $ proxyDestTcp "127.0.0.1" port2)) $ \port3 ->
+                withCApp (rawTcpProxyTo (proxyDestTcp "127.0.0.1" port3)) $ \port4 -> do
                     lbs <- HC.simpleHttp $ "http://127.0.0.1:" ++ show port4
                     S8.concat (L8.toChunks lbs) `shouldBe` content
         it "deals with streaming data" $
@@ -123,7 +165,7 @@ main = hspec $
                     liftIO $ threadDelay 10000000
              in withMan $ \manager ->
                 withWApp app $ \port1 ->
-                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 -> do
+                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 -> do
                     req <- HC.parseUrlThrow $ "http://127.0.0.1:" ++ show port2
                     mbs <- runResourceT $ timeout 1000000 $ do
                         res <- HC.http req manager
@@ -139,7 +181,7 @@ main = hspec $
                 show' (Network.Wai.KnownLength i) = S8.pack $ show i
              in withMan $ \manager ->
                 withWApp app $ \port1 ->
-                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 -> do
+                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 -> do
                     req' <- HC.parseUrlThrow $ "http://127.0.0.1:" ++ show port2
                     let req = req'
                             { HC.requestBody = HC.RequestBodyBS body
@@ -161,7 +203,7 @@ main = hspec $
                 fallback = responseLBS status500 [] "fallback used"
              in withMan $ \manager ->
                 withWApp app $ \port1 ->
-                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
+                withWApp (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
                     runTCPClient (clientSettings port2 "127.0.0.1") $ \ad -> do
                         runConduit $ yield "GET / HTTP/1.1\r\nUpgrade: websockET\r\n\r\n" .| appSink ad
                         runConduit $ yield "hello" .| appSink ad
@@ -176,9 +218,9 @@ main = hspec $
                 waiProxyTo' getDest onError = waiProxyToSettings getDest defaultWaiProxySettings { wpsOnExc = onError, wpsSetIpHeader = SIHFromHeader }
              in withMan $ \manager ->
                 withWApp (\r f -> f $ responseLBS status200 [] $ getRealIp r ) $ \port1 ->
-                withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
-                withCApp (rawProxyTo (const $ return $ Right $ ProxyDest "127.0.0.1" port2)) $ \port3 ->
-                withCApp (rawTcpProxyTo (ProxyDest "127.0.0.1" port3)) $ \port4 -> do
+                withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
+                withCApp (rawProxyTo (const $ return $ Right $ proxyDestTcp "127.0.0.1" port2)) $ \port3 ->
+                withCApp (rawTcpProxyTo (proxyDestTcp "127.0.0.1" port3)) $ \port4 -> do
                     lbs <- httpWithForwardedFor $ "http://127.0.0.1:" ++ show port4
                     lbs `shouldBe` "127.0.1.1"
         it "get real ip 2" $
@@ -191,9 +233,9 @@ main = hspec $
                 waiProxyTo' getDest onError = waiProxyToSettings getDest defaultWaiProxySettings { wpsOnExc = onError, wpsSetIpHeader = SIHFromHeader }
              in withMan $ \manager ->
                 withWApp (\r f -> f $ responseLBS status200 [] $ getRealIp r ) $ \port1 ->
-                withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
-                withCApp (rawProxyTo (const $ return $ Right $ ProxyDest "127.0.0.1" port2)) $ \port3 ->
-                withCApp (rawTcpProxyTo (ProxyDest "127.0.0.1" port3)) $ \port4 -> do
+                withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
+                withCApp (rawProxyTo (const $ return $ Right $ proxyDestTcp "127.0.0.1" port2)) $ \port3 ->
+                withCApp (rawTcpProxyTo (proxyDestTcp "127.0.0.1" port3)) $ \port4 -> do
                     lbs <- httpWithForwardedFor $ "http://127.0.0.1:" ++ show port4
                     lbs `shouldBe` "127.0.1.1"
         it "get real ip 3" $
@@ -206,9 +248,9 @@ main = hspec $
                 waiProxyTo' getDest onError = waiProxyToSettings getDest defaultWaiProxySettings { wpsOnExc = onError, wpsSetIpHeader = SIHFromHeader }
              in withMan $ \manager ->
                 withWApp (\r f -> f $ responseLBS status200 [] $ getRealIp r ) $ \port1 ->
-                withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
-                withCApp (rawProxyTo (const $ return $ Right $ ProxyDest "127.0.0.1" port2)) $ \port3 -> do
-                withCApp (rawTcpProxyTo (ProxyDest "127.0.0.1" port3)) $ \port4 -> do
+                withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager) $ \port2 ->
+                withCApp (rawProxyTo (const $ return $ Right $ proxyDestTcp "127.0.0.1" port2)) $ \port3 -> do
+                withCApp (rawTcpProxyTo (proxyDestTcp "127.0.0.1" port3)) $ \port4 -> do
                     lbs <- httpWithForwardedFor $ "http://127.0.0.1:" ++ show port4
                     lbs `shouldBe` "127.0.0.1"
         it "performs log action" $
@@ -228,12 +270,27 @@ main = hspec $
            in withMan $ \manager ->
                 withWApp (\_ f -> f $ responseLBS status200 [] "works") $ \port1 -> do
                   ref <- ioref
-                  withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ ProxyDest "127.0.0.1" port1) defaultOnExc manager ref) $ \port2 ->
-                    withCApp (rawProxyTo (const $ return $ Right $ ProxyDest "127.0.0.1" port2)) $ \port3 ->
-                      withCApp (rawTcpProxyTo (ProxyDest "127.0.0.1" port3)) $ \port4 -> do
+                  withWApp (waiProxyTo' (const $ return $ WPRProxyDest $ proxyDestTcp "127.0.0.1" port1) defaultOnExc manager ref) $ \port2 ->
+                    withCApp (rawProxyTo (const $ return $ Right $ proxyDestTcp "127.0.0.1" port2)) $ \port3 ->
+                      withCApp (rawTcpProxyTo (proxyDestTcp "127.0.0.1" port3)) $ \port4 -> do
                         _ <- HC.simpleHttp $ "http://127.0.0.1:" ++ show port4
                         lhs <- liftIO $ readIORef ref
                         lhs `shouldBe` 2
+
+    describe "http-reverse-proxy (Unix)" $ do
+        it "works" $
+            let content = "mainApp"
+             in withWAppUnix (\_ f -> f $ responseLBS status200 [] content) $ \socketPath1 -> do
+                  -- Make a special manager to pass to waiProxyTo so we can reach the Unix socket
+                  mgr1 <- HC.newManager defaultManagerSettings { managerRawConnection = createUnixConnection socketPath1 }
+                  withWAppUnix (waiProxyTo (const $ return $ WPRProxyDest $ proxyDestUnix socketPath1) defaultOnExc mgr1) $ \socketPath2 ->
+                    withCAppUnix (rawProxyTo (const $ return $ Right $ proxyDestUnix socketPath2)) $ \socketPath3 ->
+                    withCAppUnix (rawTcpProxyTo (proxyDestUnix socketPath3)) $ \socketPath4 -> do
+                      mgr <- HC.newManager defaultManagerSettings { managerRawConnection = createUnixConnection socketPath4 }
+                      req <- HC.parseUrlThrow "http://127.0.0.1/"
+                      res <- HC.httpLbs req mgr
+                      HC.responseBody res `shouldBe` content
+
     {- FIXME
     describe "waiToRaw" $ do
         it "works" $ do

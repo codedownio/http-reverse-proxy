@@ -1,5 +1,5 @@
 name:                http-reverse-proxy
-version:             0.6.1.0
+version:             0.7.0.0
 synopsis:            Reverse proxy HTTP requests, either over raw sockets or with WAI
 description:         Provides a simple means of reverse-proxying HTTP requests. The raw approach uses the same technique as leveraged by keter, whereas the WAI approach performs full request/response parsing via WAI and http-conduit.
 homepage:            https://github.com/fpco/http-reverse-proxy
@@ -16,48 +16,55 @@ library
   default-language:    Haskell2010
   exposed-modules:     Network.HTTP.ReverseProxy
   other-modules:       Paths_http_reverse_proxy
+                       Network.HTTP.ReverseProxy.Raw
+                       Network.HTTP.ReverseProxy.Types
+                       Network.HTTP.ReverseProxy.WAI
+                       Network.HTTP.ReverseProxy.WAI.SemiCachedBody
+                       Network.HTTP.ReverseProxy.WAI.Types
   if impl(ghc < 8)
     buildable: False
+  ghc-options:         -Wunused-packages -Wall -W
   build-depends:       base                   >= 4.11   && < 5
-                     , text                   >= 0.11
-                     , bytestring             >= 0.9
-                     , case-insensitive       >= 0.4
-                     , http-types             >= 0.6
-                     , word8                  >= 0.0
-                     , blaze-builder          >= 0.3
-                     , http-client            >= 0.3
-                     , wai                    >= 3.0
-                     , network
-                     , conduit                >= 1.3
-                     , conduit-extra
-                     , wai-logger
-                     , resourcet
-                     , containers
-                     , unliftio               >= 0.2
-                     , transformers
-                     , streaming-commons
+                       , blaze-builder          >= 0.3
+                       , bsb-http-chunked       >= 0.0.0.4
+                       , bytestring             >= 0.9
+                       , case-insensitive       >= 0.4
+                       , conduit                >= 1.3
+                       , conduit-extra
+                       , containers
+                       , http-client            >= 0.7.16
+                       , http-types             >= 0.6
+                       , streaming-commons
+                       , text                   >= 0.11
+                       , unliftio               >= 0.2
+                       , wai                    >= 3.0
+                       , wai-logger
+                       , word8                  >= 0.0
 
 test-suite test
-    default-language:    Haskell2010
-    type: exitcode-stdio-1.0
-    main-is: main.hs
-    hs-source-dirs: test
-    build-depends: base < 10
-                 , http-reverse-proxy
-                 , wai
-                 , http-types
-                 , hspec                      >= 1.3
-                 , warp                       >= 2.1
-                 , bytestring
-                 , conduit                    >= 1.1
-                 , conduit-extra
-                 , blaze-builder
-                 , transformers
-                 , unliftio
-                 , network
-                 , http-conduit               >= 2.3
-                 , resourcet
-                 , streaming-commons
+  default-language:    Haskell2010
+  type:                exitcode-stdio-1.0
+  main-is:             main.hs
+  hs-source-dirs:      test
+  ghc-options:         -Wunused-packages -Wall -W
+  build-depends:       base < 10
+                       , http-reverse-proxy
+                       , blaze-builder
+                       , bytestring
+                       , conduit                    >= 1.1
+                       , conduit-extra
+                       , crypton-connection
+                       , filepath
+                       , hspec                      >= 1.3
+                       , http-client
+                       , http-conduit               >= 2.3
+                       , http-types
+                       , network
+                       , resourcet
+                       , streaming-commons
+                       , unliftio
+                       , wai
+                       , warp                       >= 2.1
 
 source-repository head
   type:     git
